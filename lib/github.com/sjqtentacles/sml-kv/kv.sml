@@ -17,14 +17,14 @@ struct
   val empty : map = []
 
   (* insert or overwrite, preserving ascending key order *)
-  fun put ((k, v), m) =
+  fun insert ((k, v), m) =
     case m of
         [] => [(k, v)]
       | (k', v') :: rest =>
           (case String.compare (k, k') of
                LESS    => (k, v) :: m
              | EQUAL   => (k, v) :: rest
-             | GREATER => (k', v') :: put ((k, v), rest))
+             | GREATER => (k', v') :: insert ((k, v), rest))
 
   fun del (k, m) =
     case m of
@@ -35,10 +35,14 @@ struct
              | EQUAL   => rest
              | GREATER => (k', v') :: del (k, rest))
 
-  fun apply (Put (k, v), m) = put ((k, v), m)
+  fun apply (Put (k, v), m) = insert ((k, v), m)
     | apply (Delete k, m) = del (k, m)
 
   fun replay l = List.foldl apply empty l
+
+  (* public incremental edits (curried) *)
+  fun put m k v = insert ((k, v), m)
+  fun delete m k = del (k, m)
 
   fun get m k =
     case List.find (fn (k', _) => k' = k) m of
@@ -50,8 +54,22 @@ struct
   fun toList m = m
   fun size m = List.length m
 
+  (* folds over the (sorted) live map *)
+  fun fold f z m = List.foldl (fn ((k, v), acc) => f (k, v, acc)) z m
+
+  fun foldRange (lo, hi) f z m =
+    List.foldl
+      (fn ((k, v), acc) =>
+         if String.compare (k, lo) <> LESS andalso String.compare (k, hi) = LESS
+         then f (k, v, acc) else acc)
+      z m
+
   (* ---- compaction: minimal equivalent log, sorted Puts only ---- *)
   fun compact l = List.map Put (replay l)
+
+  (* Merge two logs (b is newer / applied second). replay (merge a b) =
+     replay (a @ b). The result is compacted (sorted Puts, no tombstones). *)
+  fun merge a b = compact (a @ b)
 
   (* ---- serialization: length-prefixed framing ---- *)
   (*   record  = 'P' field field | 'D' field
@@ -136,5 +154,52 @@ struct
       in search (0, Vector.length t) end
 
     fun member t k = Option.isSome (get t k)
+
+    (* lower-bound index: first position with key >= target *)
+    fun lowerBound (t : t) target =
+      let
+        fun go (lo, hi) =
+          if lo >= hi then lo
+          else
+            let
+              val mid = lo + (hi - lo) div 2
+              val (k', _) = Vector.sub (t, mid)
+            in
+              case String.compare (k', target) of
+                LESS => go (mid + 1, hi)
+              | _ => go (lo, mid)
+            end
+      in go (0, Vector.length t) end
+
+    (* entries with key in [lo, hi), ascending. Binary-searched bounds. *)
+    fun range (t : t) (lo, hi) =
+      let
+        val start = lowerBound t lo
+        val stop = lowerBound t hi
+      in
+        List.tabulate (stop - start, fn j => Vector.sub (t, start + j))
+      end
+
+    (* entries whose key has the given prefix, ascending *)
+    fun prefix (t : t) p =
+      let
+        val start = lowerBound t p
+        fun hasPrefix s =
+          String.size s >= String.size p
+          andalso String.substring (s, 0, String.size p) = p
+        fun go i acc =
+          if i >= Vector.length t then List.rev acc
+          else
+            let val (k, v) = Vector.sub (t, i)
+            in if hasPrefix k then go (i + 1) ((k, v) :: acc)
+               else List.rev acc  (* sorted: once prefix fails past start, done *)
+            end
+      in go start [] end
+
+    (* newer-wins merge of two sorted blocks (u is newer) *)
+    fun merge (t : t) (u : t) =
+      fromList (toList t @ toList u)  (* fromList re-replays; later wins *)
+
+    fun toLog (t : t) = List.map Put (toList t)
   end
 end

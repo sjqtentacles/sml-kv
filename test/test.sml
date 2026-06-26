@@ -103,6 +103,77 @@ struct
       val () = check "binary search misses" (K.Sstable.get st2 "key100" = NONE)
       val () = checkStringList "sstable keys sorted"
                  (["a", "c"], K.Sstable.keys st)
+
+      (* -------------------- incremental put / delete -------------------- *)
+      val () = section "incremental put / delete"
+      val im = K.put (K.put (K.put K.empty "b" "2") "a" "1") "c" "3"
+      val () = check "incremental put gets a" (K.get im "a" = SOME "1")
+      val () = checkStringList "incremental put keeps keys sorted" (["a","b","c"], K.keys im)
+      val im2 = K.put im "b" "22"
+      val () = check "incremental overwrite" (K.get im2 "b" = SOME "22")
+      val () = checkInt "overwrite keeps size" (3, K.size im2)
+      val im3 = K.delete im2 "b"
+      val () = check "incremental delete removes" (K.get im3 "b" = NONE)
+      val () = checkStringList "delete keeps order" (["a","c"], K.keys im3)
+      val () = check "delete absent is no-op" (K.keys (K.delete im3 "zzz") = ["a","c"])
+      val () = check "incremental == replay"
+                 (K.toList im = K.toList (K.replay [K.Put ("a","1"),K.Put ("b","2"),K.Put ("c","3")]))
+
+      (* -------------------- fold / foldRange -------------------- *)
+      val () = section "fold / foldRange"
+      val fm = K.replay [K.Put ("a","1"),K.Put ("b","2"),K.Put ("c","3"),K.Put ("d","4")]
+      val () = checkStringList "fold visits ascending keys"
+                 (["a","b","c","d"], List.rev (K.fold (fn (k,_,acc) => k :: acc) [] fm))
+      val () = checkInt "fold sums values"
+                 (10, K.fold (fn (_,v,acc) => acc + valOf (Int.fromString v)) 0 fm)
+      val () = checkStringList "foldRange [b,d)"
+                 (["b","c"], List.rev (K.foldRange ("b","d") (fn (k,_,acc) => k :: acc) [] fm))
+      val () = checkStringList "foldRange empty range"
+                 ([], K.foldRange ("x","z") (fn (k,_,acc) => k :: acc) [] fm)
+      val () = checkStringList "foldRange covers all"
+                 (["a","b","c","d"], List.rev (K.foldRange ("","~") (fn (k,_,acc) => k :: acc) [] fm))
+
+      (* -------------------- merge (tombstone-aware) -------------------- *)
+      val () = section "merge (newer wins)"
+      val older = [K.Put ("a","1"), K.Put ("b","2"), K.Put ("c","3")]
+      val newer = [K.Put ("b","22"), K.Delete "c", K.Put ("d","4")]
+      val merged = K.merge older newer
+      val mm = K.replay merged
+      val () = check "merge keeps a" (K.get mm "a" = SOME "1")
+      val () = check "merge overrides b" (K.get mm "b" = SOME "22")
+      val () = check "merge deletes c" (K.get mm "c" = NONE)
+      val () = check "merge adds d" (K.get mm "d" = SOME "4")
+      val () = check "merge == replay (a @ b)"
+                 (K.toList mm = K.toList (K.replay (older @ newer)))
+      val () = check "merged log has no tombstones"
+                 (List.all (fn K.Put _ => true | K.Delete _ => false) merged)
+
+      (* -------------------- Sstable range / prefix / merge / toLog ---- *)
+      val () = section "Sstable range / prefix / merge / toLog"
+      val sr = K.Sstable.fromList [("apple","1"),("apricot","2"),("banana","3"),("cherry","4"),("date","5")]
+      val () = check "range [b, d)"
+                 (K.Sstable.range sr ("b","d") = [("banana","3"),("cherry","4")])
+      val () = check "range covers all"
+                 (List.length (K.Sstable.range sr ("","~")) = 5)
+      val () = check "range empty"
+                 (K.Sstable.range sr ("x","z") = [])
+      val () = check "prefix ap"
+                 (K.Sstable.prefix sr "ap" = [("apple","1"),("apricot","2")])
+      val () = check "prefix none"
+                 (K.Sstable.prefix sr "zzz" = [])
+      val () = check "prefix single"
+                 (K.Sstable.prefix sr "ban" = [("banana","3")])
+      val s1 = K.Sstable.fromList [("a","1"),("b","2"),("c","3")]
+      val s2 = K.Sstable.fromList [("b","22"),("d","4")]
+      val sm = K.Sstable.merge s1 s2     (* s2 newer *)
+      val () = check "sstable merge newer wins b" (K.Sstable.get sm "b" = SOME "22")
+      val () = check "sstable merge keeps a" (K.Sstable.get sm "a" = SOME "1")
+      val () = check "sstable merge adds d" (K.Sstable.get sm "d" = SOME "4")
+      val () = checkInt "sstable merge size" (4, K.Sstable.size sm)
+      val () = check "toLog round-trips through replay"
+                 (K.toList (K.replay (K.Sstable.toLog sr)) = K.Sstable.toList sr)
+      val () = check "toLog is all Puts"
+                 (List.all (fn K.Put _ => true | _ => false) (K.Sstable.toLog sr))
     in
       Harness.run ()
     end

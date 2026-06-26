@@ -18,13 +18,20 @@ string from `encode` to an append-only file and rebuilds state with
   `oper list`.
 - **`replay` / `get` / `keys` / `toList` / `size`** — fold the log into a live
   map (key-sorted); reads, sorted key listing, and sorted entry dump.
+- **`put` / `delete`** — cheap incremental edits on a live map (no full
+  re-replay), keeping keys sorted.
+- **`fold` / `foldRange`** — fold live entries in ascending key order, optionally
+  restricted to a half-open key range `[lo, hi)`.
 - **`compact`** — rewrite a log into the minimal equivalent log: one `Put` per
   live key, no tombstones, ascending key order. `replay (compact l) = replay l`.
+- **`merge`** — combine two logs (the second is newer); tombstone-aware
+  newer-wins, returning a compacted log. `replay (merge a b) = replay (a @ b)`.
 - **`encode` / `decode`** — deterministic, reversible, length-prefixed framing
   of a log (the on-disk format), modelled as a `string`. Handles any bytes in
   keys/values (`:`, newlines, quotes, empties) without escaping.
 - **`Kv.Sstable`** — an immutable sorted block built from a log, with O(log n)
-  binary-search `get`.
+  binary-search `get`, plus binary-searched `range`/`prefix` scans, newer-wins
+  `merge`, and `toLog`.
 
 ## Serialization format
 
@@ -48,13 +55,18 @@ structure Kv : sig
   type map
   val empty  : map
   val replay : log -> map
+  val put    : map -> string -> string -> map
+  val delete : map -> string -> map
   val get    : map -> string -> string option
   val member : map -> string -> bool
   val keys   : map -> string list               (* sorted *)
   val toList : map -> (string * string) list      (* sorted by key *)
   val size   : map -> int
+  val fold      : (string * string * 'a -> 'a) -> 'a -> map -> 'a
+  val foldRange : string * string -> (string * string * 'a -> 'a) -> 'a -> map -> 'a
 
   val compact : log -> log
+  val merge   : log -> log -> log
   val encode  : log -> string
   val decode  : string -> log option
 
@@ -67,6 +79,10 @@ structure Kv : sig
     val toList   : t -> (string * string) list
     val keys     : t -> string list
     val size     : t -> int
+    val range    : t -> string * string -> (string * string) list
+    val prefix   : t -> string -> (string * string) list
+    val merge    : t -> t -> t
+    val toLog    : t -> log
   end
 end
 ```
@@ -85,6 +101,17 @@ val comp  = Kv.compact log                    (* [Put("user:1","alice2")] *)
 val bytes = Kv.encode comp
 val SOME comp' = Kv.decode bytes
 val true = (Kv.toList (Kv.replay comp') = Kv.toList live)
+
+(* incremental edits, range folds, and log merges *)
+val m  = Kv.put (Kv.put Kv.empty "a" "1") "b" "2"
+val m  = Kv.delete m "a"                       (* {b=2} *)
+val bs = Kv.foldRange ("a", "c") (fn (k,_,acc) => k :: acc) [] (Kv.replay log)
+val combined = Kv.merge log [Kv.Put ("user:5","erin")]  (* newer wins, compacted *)
+
+(* SSTable range/prefix scans (binary-searched) *)
+val sst   = Kv.Sstable.fromList [("apple","1"),("apricot","2"),("banana","3")]
+val aps   = Kv.Sstable.prefix sst "ap"         (* [("apple","1"),("apricot","2")] *)
+val band  = Kv.Sstable.range sst ("b", "c")    (* [("banana","3")] *)
 ```
 
 Running [`examples/demo.sml`](examples/demo.sml) with `make example` prints:
@@ -153,19 +180,22 @@ examples/
   demo.sml  put/overwrite/delete/compact/encode/decode walkthrough
 test/
   harness.sml
-  test.sml  replay, tombstones, compaction, framing, SSTable (37 checks)
+  test.sml  replay, tombstones, compaction, framing, SSTable (68 checks)
   entry.sml / main.sml
 tools/polybuild
 ```
 
 ## Tests
 
-37 deterministic checks: last-write-wins replay, delete tombstones (and
-re-puts), sorted `keys`/`toList`, minimal `compact` (verified `replay (compact
-l) = replay l` and idempotent), length-prefixed `encode`/`decode` round trips
-including special characters (`:`, newlines, quotes, empty keys/values), framing
-byte-stability, malformed-input rejection, and SSTable binary search over 100
-keys. Run `make all-tests` to verify identical output under both compilers.
+68 deterministic checks: last-write-wins replay, delete tombstones (and
+re-puts), sorted `keys`/`toList`, incremental `put`/`delete` matching `replay`,
+`fold`/`foldRange` in key order, minimal `compact` (verified `replay (compact
+l) = replay l` and idempotent), tombstone-aware `merge` (`replay (merge a b) =
+replay (a @ b)`), length-prefixed `encode`/`decode` round trips including
+special characters (`:`, newlines, quotes, empty keys/values), framing
+byte-stability, malformed-input rejection, SSTable binary search over 100 keys,
+and SSTable `range`/`prefix`/`merge`/`toLog`. Run `make all-tests` to verify
+identical output under both compilers.
 
 ## License
 
